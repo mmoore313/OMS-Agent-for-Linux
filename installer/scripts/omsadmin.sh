@@ -26,6 +26,7 @@ FILE_ONBOARD=/etc/omsagent-onboard.conf
 
 # Generated conf file containing information for this script
 CONF_OMSADMIN=$CONF_DIR/omsadmin.conf
+SYSCONF_AGENTGUID=$SYSCONF_DIR/agentguid.conf
 
 # Omsagent daemon configuration
 CONF_OMSAGENT=$CONF_DIR/omsagent.conf
@@ -452,12 +453,71 @@ onboard()
     # What happens in the --upgrade <no workspace given> scenario?
     # To seemlessly transition, the agent GUID from the primary workspace should be written to the sysconf location??
 
+    # Scenarios to consider:
+    # Customer is multi-homed already and must move to single workspace ID
+    #      (I do not think this should be common
+    #      - verify with Keiko that forcing them to --remove and --upgrade then onboard is fine)
+    # Customer installing omsagent for the first time
+    #      - This should be the easiest.
+    #      Generate an agent GUID; store it in omsadmin.conf and in the non-workspace-specific path.
+    #      Current OMS Meta Config will take this and copy it to the DSC path as expected.
+    # Customer upgrading who only has a single workspace configured.
+    #      - What is expected? We should never have a bug where upgrading should change the agent GUID.
+    #      - The simple --upgrade path should move everything to where it is expected. I think -M to omsadmin.sh should include writing to the non-workspace-specific path
+    #        since multi-homing will now be expected to have this new path moving forward, and this is already called by --upgrade in base_omsagent.data
+    #      - So in this case, -M will copy the workspace ID from the primary location to the non-workspace-specific path. No workspaces need to be updated.
+
+    # Extension upgrade scenario: workspace is --removed and then upgraded - we should functionally keep Narine's fix to propagate the agent GUID
+    #      - Look in the non-workspace-specific path. If this path doesn't exist, then create it with this saved agent GUID. Re-use this GUID.
+    # Customer is re-onboarding a workspace whose config is saved on the machine. It has an old workspace ID. (not the Extension upgrade scenario)
+    #      - Look in the non-workspace-specific path. If this path doesn't exist, then -M hasn't run, which means this bundle wasn't installed with --upgrade where a primary workspace already existed.
+    #      - In the end, I think this is the same as the extension upgrade scenario. We create it with our saved agent GUID.
+
+
+    # TODO Additional changes to make:
+    # Update any plugins which read the agent GUID from omsadmin.conf to read from the new location instead.
+    # Update OMSMetaConfigHelper (small change) to read from that path as well.
+    if [ -f $SYSCONF_AGENTGUID ]; then
+        MACHINE_AGENT_GUID=`cat $SYSCONF_AGENTGUID`
+        if [ -f $FILE_KEY -a -f $FILE_CRT -a -f $CONF_OMSADMIN ]; then
+            CONF_AGENT_GUID=`grep AGENT_GUID $CONF_OMSADMIN | cut -d= -f2`
+            if [ "$CONF_AGENT_GUID" == "$MACHINE_AGENT_GUID" ]; then
+                AGENT_GUID=$CONF_AGENT_GUID
+                log_info "Reusing previous agent GUID $AGENT_GUID"
+            else
+                AGENT_GUID=$MACHINE_AGENT_GUID
+                log_info "Workspace is using an old agent GUID: Using machine's agent GUID $AGENT_GUID"
+                GENERATE_CERTS="true"
+            fi
+        else
+            AGENT_GUID=$MACHINE_AGENT_GUID
+            log_info "Using machine's agent GUID $AGENT_GUID"
+            GENERATE_CERTS="true"
+        fi
+    elif [ -f "$DF_CONF_DIR/omsadmin.conf" ]; then
+        # TODO read the agent GUID from here
+    else
+        # TODO generate it ourselves
+        # TODO write it to $SYSCONF_AGENTGUID
+    fi
+
+    if [ -z "$GENERATE_CERTS" ]; then
+        $RUBY $MAINTENANCE_TASKS_SCRIPT -c "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$RUN_DIR/omsagent.pid" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" -w "$WORKSPACE_ID" -a "$AGENT_GUID" $CURL_VERBOSE
+        if [ $? -ne 0 ]; then
+            log_error "Error generating certs"
+            clean_exit 1
+        fi
+    fi
+
     if [ -f $FILE_KEY -a -f $FILE_CRT -a -f $CONF_OMSADMIN ]; then
         # Keep the same agent GUID by loading it from the previous conf
+        # TODO check this against the agent GUID in the sysconf path - if they're not the same, then we have to regenerate the certs
+        # If they are the same, then we can re-use it
         AGENT_GUID=`grep AGENT_GUID $CONF_OMSADMIN | cut -d= -f2`
         log_info "Reusing previous agent GUID $AGENT_GUID"
     else
         AGENT_GUID=`$RUBY -e "require 'securerandom'; print SecureRandom.uuid"`
+        # TODO - does MAINTENANCE_TASKS_SCRIPT pull anything from CONF_OMSADMIN for this scenario? If so, make sure it doesn't pull agent GUID
         $RUBY $MAINTENANCE_TASKS_SCRIPT -c "$CONF_OMSADMIN" "$FILE_CRT" "$FILE_KEY" "$RUN_DIR/omsagent.pid" "$CONF_PROXY" "$OS_INFO" "$INSTALL_INFO" -w "$WORKSPACE_ID" -a "$AGENT_GUID" $CURL_VERBOSE
         if [ $? -ne 0 ]; then
           log_error "Error generating certs"
